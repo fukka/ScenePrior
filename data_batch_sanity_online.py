@@ -1,0 +1,148 @@
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+from imresize import imresize
+from util import read_image, create_gradient_map, im2tensor, create_probability_map, nn_interpolation
+
+
+class DataGenerator(Dataset):
+    """
+    The data generator loads an image once, calculates it's gradient map on initialization and then outputs a cropped version
+    of that image whenever called.
+    """
+
+    def __init__(self, conf, gan, image_clean, image_lr):
+        # Default shapes
+        self.bit_depth = conf.input_bitdepth
+        self.g_input_shape = conf.input_crop_size
+        if hasattr(gan, 'G'):
+            self.d_input_shape = gan.G.output_size  # shape entering D downscaled by G
+        else:
+            self.d_input_shape = self.g_input_shape
+        self.d_output_shape = self.d_input_shape - gan.D.forward_shave
+
+        # Read input image
+        self.image_clean = image_clean
+        self.image_lr = image_lr
+        assert len(self.image_clean.shape) == 4
+
+        self.shave_edges(scale_factor=conf.scale_factor, real_image=conf.real_image)
+
+        self.in_rows, self.in_cols = self.image_clean.shape[1:3]
+
+        # Create prob map for choosing the crop
+        self.crop_indices_for_g_list, self.crop_indices_for_d_list = self.make_list_of_crop_indices(conf=conf)
+
+    def __len__(self):
+        return 1
+
+    def __getitem__(self, idx):
+        """Get a crop for both G and D """
+        g_in = self.next_crop(for_g=True, idx=idx)
+        d_in = self.next_crop(for_g=False, idx=idx)
+        #
+        # return g_in, d_in
+        # g_in_list = []
+        # d_in_list = []
+        # for img_idx in range(self.image_clean.shape[0]):
+        #     g_in = im2tensor(self.image_clean[img_idx])
+        #     g_in_list.append(g_in)
+        #     d_in = im2tensor(self.image_lr[img_idx])
+        #     d_in_list.append(d_in)
+        # g_in = torch.cat(g_in_list, dim=0)
+        # d_in = torch.cat(d_in_list, dim=0)
+        return g_in, d_in
+
+    def next_crop_single(self, for_g, idx, img_idx):
+        """Return a crop according to the pre-determined list of indices. Noise is added to crops for D"""
+        size = self.g_input_shape if for_g else self.d_input_shape
+        top, left = self.get_top_left_single(size, for_g, idx, img_idx)
+        if for_g:
+            crop_im = self.image_clean[img_idx, top:top + size, left:left + size, :]
+        else:
+            crop_im = self.image_lr[img_idx, top:top + size, left:left + size, :]
+        # TODO
+        # if not for_g:  # Add noise to the image for d
+        #     crop_im = crop_im + np.random.randn(*crop_im.shape) / 255.0
+        return im2tensor(crop_im)
+
+    def next_crop(self, for_g, idx):
+        crop_im_list = []
+        for img_idx in range(self.image_clean.shape[0]):
+            crop_im = self.next_crop_single(for_g, idx, img_idx)
+            crop_im_list.append(crop_im)
+        crop_im = torch.cat(crop_im_list, dim=0)
+        return crop_im
+
+    def make_list_of_crop_indices(self, conf):
+        iterations = conf.max_iters
+        prob_map_big_list, prob_map_sml_list = self.create_prob_maps(scale_factor=conf.scale_factor)
+        crop_indices_for_g_list = []
+        crop_indices_for_d_list = []
+        for i in range(len(prob_map_big_list)):
+            crop_indices_for_g = np.random.choice(a=len(prob_map_sml_list[i]), size=iterations, p=prob_map_sml_list[i])
+            crop_indices_for_d = np.random.choice(a=len(prob_map_big_list[i]), size=iterations, p=prob_map_big_list[i])
+            crop_indices_for_g_list.append(crop_indices_for_g)
+            crop_indices_for_d_list.append(crop_indices_for_d)
+        return crop_indices_for_g_list, crop_indices_for_d_list
+
+    def create_prob_maps(self, scale_factor):
+        # Create loss maps for input image and downscaled one
+        loss_map_big_list = []
+        for i in range(self.image_clean.shape[0]):
+            loss_map_big = create_gradient_map(self.image_lr[i])
+            loss_map_big_list.append(loss_map_big)
+        loss_map_big = np.stack(loss_map_big_list, axis=0)
+
+        loss_map_sml_list = []
+        for i in range(self.image_clean.shape[0]):
+            loss_map_sml = create_gradient_map(
+                imresize(im=self.image_clean[i], scale_factor=scale_factor, kernel='cubic')
+            )
+            loss_map_sml_list.append(loss_map_sml)
+        loss_map_sml = np.stack(loss_map_sml_list, axis=0)
+        # Create corresponding probability maps
+
+        prob_map_big_list = []
+        for i in range(self.image_clean.shape[0]):
+            prob_map_big = create_probability_map(loss_map_big[i], self.d_input_shape)
+            prob_map_big_list.append(prob_map_big)
+
+        prob_map_sml_list = []
+        for i in range(self.image_clean.shape[0]):
+            prob_map_sml = create_probability_map(
+                nn_interpolation(loss_map_sml[i], int(1 / scale_factor)), self.g_input_shape
+            )
+            prob_map_sml_list.append(prob_map_sml)
+
+        # print(type(prob_map_big), type(prob_map_sml))
+        # try:
+        #     print(len(prob_map_big), len(prob_map_sml))
+        # except:
+        #     print(prob_map_big.shape, prob_map_sml.shape)
+
+        return prob_map_big_list, prob_map_sml_list
+
+    def shave_edges(self, scale_factor, real_image):
+        """Shave pixels from edges to avoid code-bugs"""
+        # Crop 10 pixels to avoid boundaries effects in synthetically generated examples
+        if not real_image:
+            self.image_clean = self.image_clean[:, 10:-10, 10:-10, :]
+            self.image_lr = self.image_lr[:, 10:-10, 10:-10, :]
+        # Crop pixels for the shape to be divisible by the scale factor
+        sf = int(1 / scale_factor)
+        shape = self.image_lr.shape
+        self.image_lr = self.image_lr[:, :-(shape[1] % sf), :, :] if shape[1] % sf > 0 else self.image_lr
+        self.image_lr = self.image_lr[:, :, :-(shape[2] % sf), :] if shape[2] % sf > 0 else self.image_lr
+
+        self.image_clean = self.image_clean[:, :-(shape[1] % sf), :, :] if shape[1] % sf > 0 else self.image_clean
+        self.image_clean = self.image_clean[:, :, :-(shape[2] % sf), :] if shape[2] % sf > 0 else self.image_clean
+
+    def get_top_left_single(self, size, for_g, idx, img_idx):
+        """Translate the center of the index of the crop to it's corresponding top-left"""
+        # center = self.crop_indices_for_g_list[img_idx][idx] if for_g else self.crop_indices_for_d_list[img_idx][idx]
+        center = self.crop_indices_for_g_list[img_idx][idx]
+        row, col = int(center / self.in_cols), center % self.in_cols
+        top, left = min(max(0, row - size // 2), self.in_rows - size), min(max(0, col - size // 2), self.in_cols - size)
+        # Choose even indices (to avoid misalignment with the loss map for_g)
+        return top - top % 2, left - left % 2
